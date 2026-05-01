@@ -154,6 +154,8 @@ _TEXT_GENERATION_MODELS = {
     "LongcatFlashForCausalLM": ("longcat_flash", "LongcatFlashForCausalLM"),
     "MambaForCausalLM": ("mamba", "MambaForCausalLM"),
     "Mamba2ForCausalLM": ("mamba2", "Mamba2ForCausalLM"),
+    "MambaLMHeadModel": ("simamba", "SimambaForCausalLM"),
+    "SimambaForCausalLM": ("simamba", "SimambaForCausalLM"),
     "MiniCPMForCausalLM": ("minicpm", "MiniCPMForCausalLM"),
     "MiniCPM3ForCausalLM": ("minicpm3", "MiniCPM3ForCausalLM"),
     "MiniMaxForCausalLM": ("minimax_text_01", "MiniMaxText01ForCausalLM"),

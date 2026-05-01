@@ -1341,6 +1341,10 @@ class ModelConfig:
         if chunk_size is None:
             # used by e.g. Mamba2, NemotronH, Zamba
             chunk_size = getattr(self.hf_text_config, "chunk_size", None)
+        if chunk_size is None:
+            ssm_cfg = getattr(self.hf_text_config, "ssm_cfg", None)
+            if isinstance(ssm_cfg, dict):
+                chunk_size = ssm_cfg.get("chunk_size")
 
         # Since Mamba1 does not have a chunk notion
         # we use a default chunk size of 1024.

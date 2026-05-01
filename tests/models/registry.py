@@ -393,6 +393,10 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
             "random": "yujiepan/mamba2-codestral-v0.1-tiny-random",
         },
     ),
+    "MambaLMHeadModel": _HfExamplesInfo(
+        "local/simamba-mamba-lm-head-model",
+        is_available_online=False,
+    ),
     "FalconMambaForCausalLM": _HfExamplesInfo("tiiuae/falcon-mamba-7b-instruct"),
     "MiniCPMForCausalLM": _HfExamplesInfo(
         "openbmb/MiniCPM-2B-sft-bf16", trust_remote_code=True
@@ -514,6 +518,10 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
     "SeedOssForCausalLM": _HfExamplesInfo(
         "ByteDance-Seed/Seed-OSS-36B-Instruct",
         trust_remote_code=True,
+    ),
+    "SimambaForCausalLM": _HfExamplesInfo(
+        "local/simamba-for-causal-lm",
+        is_available_online=False,
     ),
     "SmolLM3ForCausalLM": _HfExamplesInfo("HuggingFaceTB/SmolLM3-3B"),
     "StableLMEpochForCausalLM": _HfExamplesInfo("stabilityai/stablelm-zephyr-3b"),

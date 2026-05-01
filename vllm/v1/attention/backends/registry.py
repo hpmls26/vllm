@@ -196,6 +196,7 @@ class MambaAttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
 MAMBA_TYPE_TO_BACKEND_MAP = {
     "mamba1": MambaAttentionBackendEnum.MAMBA1.name,
     "mamba2": MambaAttentionBackendEnum.MAMBA2.name,
+    "simamba": MambaAttentionBackendEnum.MAMBA2.name,
     "short_conv": MambaAttentionBackendEnum.SHORT_CONV.name,
     "linear_attention": MambaAttentionBackendEnum.LINEAR.name,
     "gdn_attention": MambaAttentionBackendEnum.GDN_ATTN.name,
