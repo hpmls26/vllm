@@ -74,6 +74,10 @@ def _split_lengths(query_start_loc: torch.Tensor | None, fallback_len: int) -> l
     return torch.diff(query_start_loc).tolist()
 
 
+def _cdiv(value: int, divisor: int) -> int:
+    return (value + divisor - 1) // divisor
+
+
 @PluggableLayer.register("simamba_mixer")
 class SimambaMixer(MambaBase, PluggableLayer):
     '''
@@ -375,51 +379,40 @@ class SimambaMixer(MambaBase, PluggableLayer):
 
             return loader
 
+        def set_loader(weight: torch.Tensor, loader) -> None:
+            if hasattr(weight, "weight_loader"):
+                delattr(weight, "weight_loader")
+            set_weight_attrs(weight, {"weight_loader": loader})
+
          # Register loaders for all projection layers
-        set_weight_attrs(
-            self.z_proj.weight,
-            {"weight_loader": make_in_proj_loader("z", self.d_inner, True)},
-        )
-        set_weight_attrs(
-            self.x_proj.weight,
-            {"weight_loader": make_in_proj_loader("x", self.d_inner, True)},
-        )
-        set_weight_attrs(
+        set_loader(self.z_proj.weight, make_in_proj_loader("z", self.d_inner, True))
+        set_loader(self.x_proj.weight, make_in_proj_loader("x", self.d_inner, True))
+        set_loader(
             self.b_proj.weight,
-            {"weight_loader": make_in_proj_loader("b", self.n_groups * self.ssm_state_size, False)},
+            make_in_proj_loader("b", self.n_groups * self.ssm_state_size, False),
         )
-        set_weight_attrs(
+        set_loader(
             self.c_proj.weight,
-            {"weight_loader": make_in_proj_loader("c", self.n_groups * self.ssm_state_size, False)},
+            make_in_proj_loader("c", self.n_groups * self.ssm_state_size, False),
         )
-        set_weight_attrs(
-            self.dt_proj.weight,
-            {"weight_loader": make_in_proj_loader("dt", self.num_heads, True)},
+        set_loader(
+            self.dt_proj.weight, make_in_proj_loader("dt", self.num_heads, True)
         )
-        set_weight_attrs(
-            self.a_proj.weight,
-            {"weight_loader": make_in_proj_loader("a", self.num_heads, True)},
+        set_loader(
+            self.a_proj.weight, make_in_proj_loader("a", self.num_heads, True)
         )
-        set_weight_attrs(
+        set_loader(
             self.simpson_proj.weight,
-            {"weight_loader": make_in_proj_loader("simpson", self.num_heads, True)},
+            make_in_proj_loader("simpson", self.num_heads, True),
         )
         if self.midpoint_proj is not None:
-            set_weight_attrs(
+            set_loader(
                 self.midpoint_proj.weight,
-                {
-                    "weight_loader": make_in_proj_loader(
-                        "midpoint", self.num_heads, True
-                    )
-                },
+                make_in_proj_loader("midpoint", self.num_heads, True),
             )
-        set_weight_attrs(
+        set_loader(
             self.angle_proj.weight,
-            {
-                "weight_loader": make_in_proj_loader(
-                    "angles", self.num_rope_angles, False
-                )
-            },
+            make_in_proj_loader("angles", self.num_rope_angles, False),
         )
 
         def local_head_loader(param: Parameter, loaded_weight: torch.Tensor) -> None:
@@ -438,17 +431,17 @@ class SimambaMixer(MambaBase, PluggableLayer):
                 ]
             )
 
-        set_weight_attrs(self.dt_bias, {"weight_loader": local_head_loader})
-        set_weight_attrs(self.D, {"weight_loader": local_head_loader})
-        set_weight_attrs(self.B_bias, {"weight_loader": local_head_state_loader})
-        set_weight_attrs(self.C_bias, {"weight_loader": local_head_state_loader})
+        set_loader(self.dt_bias, local_head_loader)
+        set_loader(self.D, local_head_loader)
+        set_loader(self.B_bias, local_head_state_loader)
+        set_loader(self.C_bias, local_head_state_loader)
         if self.norm is not None:
             start = self.tp_rank * self.local_d_inner
 
             def norm_loader(param: Parameter, loaded_weight: torch.Tensor) -> None:
                 param.data.copy_(loaded_weight[start : start + param.shape[0]])
 
-            set_weight_attrs(self.norm.weight, {"weight_loader": norm_loader})
+            set_loader(self.norm.weight, norm_loader)
 
     @property
     def chunk_size(self) -> int:
@@ -598,82 +591,187 @@ class SimambaMixer(MambaBase, PluggableLayer):
         return tuple(out)
 
     def _run_prefill(
-        self,
-        hidden_states: torch.Tensor,
-        metadata: Mamba2AttentionMetadata,
-        p: dict[str, torch.Tensor | None]
-    ) -> torch.Tensor:
-        '''
-        Prefill processes full sequences (no autoregressive stepping)
-        '''
+    self,
+    hidden_states: torch.Tensor,
+    metadata: Mamba2AttentionMetadata,
+    p: dict[str, torch.Tensor | None],
+) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Prefill processes full sequences using the chunked SSM kernel.
 
+        In `mamba_cache_mode == "all"`, intermediate block-boundary states are
+        written by falling back to step-by-step execution so every block gets
+        its state cached.  For the default (non-all-cache) mode the fast
+        chunked kernel is always used.
+        """
         assert metadata.query_start_loc_p is not None
         assert metadata.state_indices_tensor_p is not None
 
-        # Load initial states from cache (or zeros if missing)
-        state_indices = metadata.state_indices_tensor_p
-        init_states = self._gather_states(
-            state_indices,
-            has_initial=metadata.has_initial_states_p,
+        state_indices   = metadata.state_indices_tensor_p   # [num_seqs, num_blocks] or [num_seqs]
+        q_lens          = _split_lengths(metadata.query_start_loc_p, metadata.num_prefills)
+        is_cache_all    = (
+            self.cache_config is not None
+            and getattr(self.cache_config, "mamba_cache_mode", None) == "all"
         )
-        
-        # Switch: use precomputed projections
-        n = hidden_states.shape[0]
-        z = p["z"].view(n, self.local_num_heads, self.head_dim)   # shaped here, once
-        x = p["x"].view(n, self.local_num_heads, self.head_dim)
-        b = self.B_norm(p["b"].view(n, self.n_groups, self.ssm_state_size))
-        c = self.C_norm(p["c"].view(n, self.n_groups, self.ssm_state_size))
-        dt = F.softplus(p["dd_dt"] + self.dt_bias)
-        a = -F.softplus(p["dd_a"].float())
-        adt = a * dt
-        simpson = torch.sigmoid(p["simpson"])
-        midpoint = torch.sigmoid(p["midpoint"]) if p["midpoint"] is not None else None
+        block_size      = (
+            getattr(self.cache_config, "mamba_block_size", 1)
+            if self.cache_config is not None
+            else 1
+        )
 
-        # Run full sequence SSM computation (either reference or Triton backend)
-        if self.simamba_backend == SIMAMBA_BACKEND_REFERENCE:
-            out, *final_states = simamba_siso_combined(
-                Q=q,
-                K=k,
-                V=v,
-                ADT=adt_seq,
-                DT=dt_seq,
-                Simpson=simpson_seq,
-                Midpoint=midpoint_seq,
-                Q_bias=self.C_bias,
-                K_bias=self.B_bias,
-                Angles=angles_seq,
-                D=self.D,
-                Z=z_seq if not self.is_outproj_norm else None,
-                Input_States=init_states,
-                chunk_size=self.chunk_size,
-                return_final_states=True,
-                boundary_mode=self.simpson_boundary_mode,
-            )
-        else:
-            out, *final_states = simamba_triton_siso_combined(
-                Q=q,
-                K=k,
-                V=v,
-                ADT=adt_seq,
-                DT=dt_seq,
-                Simpson=simpson_seq,
-                Midpoint=midpoint_seq,
-                Q_bias=self.C_bias,
-                K_bias=self.B_bias,
-                Angles=angles_seq,
-                D=self.D,
-                Z=z_seq if not self.is_outproj_norm else None,
-                Initial_States=init_states,
-                chunk_size=self.chunk_size,
-                return_final_states=True,
-                cu_seqlens=metadata.query_start_loc_p,
-            )
-        final_states_t = tuple(final_states)
-        self._scatter_states(state_indices, final_states_t)
+        if is_cache_all:
+            assert metadata.num_computed_tokens_p is not None
+            assert metadata.block_idx_last_computed_token is not None
+            # state_indices_tensor_p rows correspond to prefill seqs only,
+            # but num_decodes may shift the slice if decode seqs share metadata.
+            block_idx_last_computed = metadata.block_idx_last_computed_token
 
-        # Flatten back to [tokens, dim]
-        # NOTE: we now return z alongisde in its original form for caching
-        return out.view(n, self.local_d_inner), z
+        token_offset = 0
+        out_chunks: list[torch.Tensor] = []
+        z_chunks:   list[torch.Tensor] = []
+
+        for req_idx, q_len in enumerate(q_lens):
+            tok    = slice(token_offset, token_offset + q_len)
+            p_seq  = {k: (v[tok] if v is not None else None) for k, v in p.items()}
+            z_seq  = p_seq["z"]
+            assert z_seq is not None
+
+            has_init = (
+                metadata.has_initial_states_p[req_idx : req_idx + 1]
+                if metadata.has_initial_states_p is not None
+                else None
+            )
+
+            if is_cache_all:
+                # -----------------------------------------------------------
+                # Cache-all mode: must write state at every block boundary.
+                # Use step-by-step execution so we can scatter at each boundary.
+                # This is intentionally slower; it is only used when the caller
+                # specifically requests full intermediate state caching.
+                # -----------------------------------------------------------
+                num_computed = int(metadata.num_computed_tokens_p[req_idx].item())
+                init_col     = block_idx_last_computed[req_idx : req_idx + 1]
+
+                states = self._gather_states(
+                    state_indices[req_idx : req_idx + 1],
+                    state_cols=init_col,
+                    has_initial=has_init,
+                )
+                req_out: list[torch.Tensor] = []
+
+                for step_idx in range(q_len):
+                    p_step = {
+                        k: (v[step_idx : step_idx + 1] if v is not None else None)
+                        for k, v in p_seq.items()
+                    }
+                    y_step, states = self._run_step_batch(
+                        hidden_states[tok][step_idx : step_idx + 1], states, p_step
+                    )
+                    req_out.append(y_step)
+
+                    token_pos = num_computed + step_idx + 1
+                    at_block_boundary = (token_pos % block_size == 0)
+                    is_last_step      = (step_idx == q_len - 1)
+
+                    if at_block_boundary or is_last_step:
+                        block_idx = _cdiv(token_pos, block_size) - 1
+                        self._scatter_states(
+                            state_indices[req_idx : req_idx + 1, block_idx], states
+                        )
+
+                out_chunks.append(torch.cat(req_out, dim=0))
+
+            else:
+                # -----------------------------------------------------------
+                # Standard mode: use the fast chunked SSM kernel for the full
+                # sequence, scatter only the final state.
+                # -----------------------------------------------------------
+                n = q_len
+
+                # Gather initial state (flat 1D index for this sequence).
+                # state_indices may be 1D [num_seqs] or 2D [num_seqs, 1].
+                si = state_indices[req_idx : req_idx + 1]
+                if si.ndim == 2:
+                    si = si[:, 0]   # take the single block column
+
+                init_states = self._gather_states(si, has_initial=has_init)
+
+                b_grouped, c_grouped = self._norm_bc(p_seq, n)
+                adt, dt, simpson, midpoint = self._compute_gates(p_seq)
+
+                q_k = c_grouped.view(1, n, self.n_groups, self.ssm_state_size)
+                k_k = b_grouped.view(1, n, self.n_groups, self.ssm_state_size)
+                v_k = p_seq["x"].view(1, n, self.local_num_heads, self.head_dim)
+                z_k = z_seq.view(1, n, self.local_num_heads, self.head_dim)
+                angles_k = (
+                    p_seq["angles"]
+                    .view(1, n, 1, self.num_rope_angles)
+                    .expand(1, n, self.local_num_heads, -1)
+                )
+                adt_k     = adt.transpose(0, 1).unsqueeze(0)
+                dt_k      = dt.transpose(0, 1).unsqueeze(0)
+                simpson_k = simpson.transpose(0, 1).unsqueeze(0)
+                midpoint_k = (
+                    midpoint.transpose(0, 1).unsqueeze(0)
+                    if midpoint is not None else None
+                )
+
+                if self.simamba_backend == SIMAMBA_BACKEND_REFERENCE:
+                    out, *final_states = simamba_siso_combined(
+                        Q=q_k,
+                        K=k_k,
+                        V=v_k,
+                        ADT=adt_k,
+                        DT=dt_k,
+                        Simpson=simpson_k,
+                        Midpoint=midpoint_k,
+                        Q_bias=self.C_bias,
+                        K_bias=self.B_bias,
+                        Angles=angles_k,
+                        D=self.D,
+                        Z=z_k if not self.is_outproj_norm else None,
+                        Input_States=init_states,
+                        chunk_size=self.chunk_size,
+                        return_final_states=True,
+                        boundary_mode=self.simpson_boundary_mode,
+                    )
+                else:
+                    # Build per-sequence cu_seqlens for this single sequence.
+                    cu = torch.tensor(
+                        [0, n],
+                        device=hidden_states.device,
+                        dtype=torch.int32,
+                    )
+                    out, *final_states = simamba_triton_siso_combined(
+                        Q=q_k,
+                        K=k_k,
+                        V=v_k,
+                        ADT=adt_k,
+                        DT=dt_k,
+                        Simpson=simpson_k,
+                        Midpoint=midpoint_k,
+                        Q_bias=self.C_bias,
+                        K_bias=self.B_bias,
+                        Angles=angles_k,
+                        D=self.D,
+                        Z=z_k if not self.is_outproj_norm else None,
+                        Initial_States=init_states,
+                        chunk_size=self.chunk_size,
+                        return_final_states=True,
+                        cu_seqlens=cu,
+                    )
+
+                # Scatter final state into the single write slot.
+                write_si = state_indices[req_idx : req_idx + 1]
+                if write_si.ndim == 2:
+                    write_si = write_si[:, 0]
+                self._scatter_states(write_si, tuple(final_states))
+                out_chunks.append(out.view(n, self.local_d_inner))
+
+            z_chunks.append(z_seq)
+            token_offset += q_len
+
+        return torch.cat(out_chunks, dim=0), torch.cat(z_chunks, dim=0)
 
     def _run_decode(
         self,
@@ -690,6 +788,25 @@ class SimambaMixer(MambaBase, PluggableLayer):
         # Split decode tokens into per-request lengths
         q_lens = _split_lengths(metadata.query_start_loc_d, metadata.num_decodes)
         out_chunks: list[torch.Tensor] = []
+        z_chunks: list[torch.Tensor] = []
+        is_cache_all = self.cache_config.mamba_cache_mode == "all"
+        block_size = self.cache_config.mamba_block_size
+
+        if is_cache_all:
+            assert metadata.block_idx_last_computed_token is not None
+            block_idx_last_computed_token = metadata.block_idx_last_computed_token[
+                : metadata.num_decodes
+            ]
+            num_computed_tokens = metadata.seq_lens[: metadata.num_decodes].to(
+                torch.int64
+            ) - torch.tensor(
+                q_lens,
+                device=hidden_states.device,
+                dtype=torch.int64,
+            )
+        else:
+            block_idx_last_computed_token = None
+            num_computed_tokens = None
 
         # Determine which column of state_indices to read (last accepted token)
         start_cols = (
@@ -700,40 +817,75 @@ class SimambaMixer(MambaBase, PluggableLayer):
 
         # Fast path: all sequences are single-token -> batch step
         if all(q_len == 1 for q_len in q_lens):
-            init_states = self._gather_states(state_indices, state_cols=start_cols)
+            init_cols = block_idx_last_computed_token if is_cache_all else start_cols
+            init_states = self._gather_states(state_indices, state_cols=init_cols)
             y_flat, next_states = self._run_step_batch(hidden_states, init_states, p)
-            self._scatter_states(state_indices[:, 0], next_states)
+            if is_cache_all:
+                output_cols = torch.div(
+                    num_computed_tokens + 1 + block_size - 1,
+                    block_size,
+                    rounding_mode="floor",
+                ) - 1
+                row_ids = torch.arange(
+                    state_indices.shape[0], device=state_indices.device
+                )
+                output_indices = state_indices[row_ids, output_cols]
+                self._scatter_states(output_indices, next_states)
+            else:
+                self._scatter_states(state_indices[:, 0], next_states)
             return y_flat, p["z"]
 
         # General path: variable-length decode per request
         token_offset = 0
         for req_idx, q_len in enumerate(q_lens):
+            tok = slice(token_offset, token_offset + q_len)
+            p_seq = {k: (v[tok] if v is not None else None) for k, v in p.items()}
+            z_seq = p_seq["z"]
+            assert z_seq is not None
+
+            init_cols = (
+                block_idx_last_computed_token[req_idx : req_idx + 1]
+                if is_cache_all
+                else start_cols[req_idx : req_idx + 1]
+            )
             states = self._gather_states(
                 state_indices[req_idx : req_idx + 1],
-                state_cols=start_cols[req_idx : req_idx + 1],
+                state_cols=init_cols,
             )
             req_out: list[torch.Tensor] = []
+            base_num_computed = (
+                int(num_computed_tokens[req_idx].item()) if is_cache_all else 0
+            )
 
             # Step through tokens sequentially
             for step_idx in range(q_len):
-                tok = slice(token_offset, token_offset + 1)
-                p_step = {k: (v[tok] if v is not None else None) for k, v in p.items()}
-                # p_step passed not reprojected compared to old double projection method in decode path
+                p_step = {
+                    k: (v[step_idx : step_idx + 1] if v is not None else None)
+                    for k, v in p_seq.items()
+                }
                 y_step, next_states = self._run_step_batch(
-                    hidden_states[tok], states, p_step   
+                    hidden_states[tok][step_idx : step_idx + 1], states, p_step
                 )
+                states = next_states
 
                 # Save updated state for this token
-                self._scatter_states(
-                    state_indices[req_idx : req_idx + 1, step_idx],
-                    states,
-                )
-                req_out.append(out_step)
-                token_offset += 1
+                if is_cache_all:
+                    token_pos = base_num_computed + step_idx + 1
+                    block_idx = _cdiv(token_pos, block_size) - 1
+                    self._scatter_states(
+                        state_indices[req_idx : req_idx + 1, block_idx], states
+                    )
+                else:
+                    self._scatter_states(
+                        state_indices[req_idx : req_idx + 1, step_idx], states
+                    )
+                req_out.append(y_step)
 
             out_chunks.append(torch.cat(req_out, dim=0))
+            z_chunks.append(z_seq)
+            token_offset += q_len
 
-        return torch.cat(out_chunks, dim=0)
+        return torch.cat(out_chunks, dim=0), torch.cat(z_chunks, dim=0)
 
     def _expand_bc_to_heads(
         self,
@@ -834,7 +986,7 @@ class SimambaMixer(MambaBase, PluggableLayer):
         '''
         Apply optional output normalization (e.g. gated / RMSNorm variant)
         '''
-        if self.norm is not None and z_local is not None:
+        if self.norm is not None and z is not None:
             # Flatten now that we get original z
             z_flat = z.reshape(y.shape[0], self.local_d_inner)
             y = self.norm(y, z_flat)
@@ -856,7 +1008,26 @@ class SimambaMixer(MambaBase, PluggableLayer):
         # Case 1: No metadata so treat as single prefill (standalone forward)
         if attn_metadata is None:
             p = self._project(hidden_states)
-            y_local, z_shaped = self._run_prefill(hidden_states, dummy_metadata, p)
+            init_states = tuple(
+                torch.zeros(
+                    (1,) + shape,
+                    device=hidden_states.device,
+                    dtype=dtype,
+                )
+                for shape, dtype in zip(self.get_state_shape(), self.get_state_dtype())
+            )
+            req_out: list[torch.Tensor] = []
+            for idx in range(hidden_states.shape[0]):
+                p_step = {
+                    k: (v[idx : idx + 1] if v is not None else None)
+                    for k, v in p.items()
+                }
+                y_step, init_states = self._run_step_batch(
+                    hidden_states[idx : idx + 1], init_states, p_step
+                )
+                req_out.append(y_step)
+            y_local = torch.cat(req_out, dim=0)
+            z_shaped = p["z"]
             output[: hidden_states.shape[0]] = self._finalize(
                 y_local, z_shaped if self.norm is not None else None
             )
