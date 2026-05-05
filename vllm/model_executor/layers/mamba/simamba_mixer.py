@@ -599,6 +599,7 @@ class SimambaMixer(MambaBase, PluggableLayer):
         self,
         hidden_states: torch.Tensor,
         metadata: Mamba2AttentionMetadata,
+        p: dict[str, torch.Tensor | None]
     ) -> torch.Tensor:
         '''
         Prefill processes full sequences (no autoregressive stepping)
@@ -613,28 +614,18 @@ class SimambaMixer(MambaBase, PluggableLayer):
             state_indices,
             has_initial=metadata.has_initial_states_p,
         )
-
-        # Project hidden states into SSM components
-        z, x, b, c, adt, midpoint, dt, angles, simpson = self._prep_sequence_inputs(
-            hidden_states
-        )
-        # Reshape into sequence format expected by kernels
-        q = c.view(1, -1, self.n_groups, self.ssm_state_size)
-        k = b.view(1, -1, self.n_groups, self.ssm_state_size)
-        v = x.view(1, -1, self.local_num_heads, self.head_dim)
-        z_seq = z.view(1, -1, self.local_num_heads, self.head_dim)
-
-        # Expand angles across heads
-        angles_seq = (
-            angles.view(1, -1, 1, self.num_rope_angles)
-            .expand(1, -1, self.local_num_heads, -1)
-        )
-        adt_seq = adt.transpose(0, 1).unsqueeze(0)
-        dt_seq = dt.transpose(0, 1).unsqueeze(0)
-        simpson_seq = simpson.transpose(0, 1).unsqueeze(0)
-        midpoint_seq = (
-            midpoint.transpose(0, 1).unsqueeze(0) if midpoint is not None else None
-        )
+        
+        # Switch: use precomputed projections
+        n = hidden_states.shape[0]
+        z = p["z"].view(n, self.local_num_heads, self.head_dim)   # shaped here, once
+        x = p["x"].view(n, self.local_num_heads, self.head_dim)
+        b = self.B_norm(p["b"].view(n, self.n_groups, self.ssm_state_size))
+        c = self.C_norm(p["c"].view(n, self.n_groups, self.ssm_state_size))
+        dt = F.softplus(p["dd_dt"] + self.dt_bias)
+        a = -F.softplus(p["dd_a"].float())
+        adt = a * dt
+        simpson = torch.sigmoid(p["simpson"])
+        midpoint = torch.sigmoid(p["midpoint"]) if p["midpoint"] is not None else None
 
         # Run full sequence SSM computation (either reference or Triton backend)
         if self.simamba_backend == SIMAMBA_BACKEND_REFERENCE:
@@ -679,7 +670,8 @@ class SimambaMixer(MambaBase, PluggableLayer):
         self._scatter_states(state_indices, final_states_t)
 
         # Flatten back to [tokens, dim]
-        return out.view(-1, self.local_d_inner)
+        # NOTE: we now return z alongisde in its original form for caching
+        return out.view(n, self.local_d_inner), z
 
     def _run_decode(
         self,
@@ -925,8 +917,9 @@ class SimambaMixer(MambaBase, PluggableLayer):
         if prefill_tokens > 0:
             hs_p = hidden_states[decode_tokens:]
             p_p = self._project(hs_p)
-            outputs.append(self._run_prefill(hs_p, metadata))
-            z_chunks.append(p_p["z"])
+            y_p, z_p = self._run_prefill(hs_p, metadata, p_p)  # p passed in to fix double projection
+            outputs.append(y_p)
+            z_chunks.append(z_p)
 
         # Concatenate outputs from decode + prefill paths
         y_local = torch.cat(outputs, dim=0)
