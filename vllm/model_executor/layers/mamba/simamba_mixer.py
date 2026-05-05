@@ -737,31 +737,24 @@ class SimambaMixer(MambaBase, PluggableLayer):
         self,
         hidden_states: torch.Tensor,
         states: tuple[torch.Tensor, ...],
+        p: dict[str, torch.Tensor | None]
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
         '''
         Single-step SSM update (used in decode)
         '''
         # Project inputs into SSM parameter space
-        p = self._project(hidden_states)
+        #p = self._project(hidden_states)
 
-        z = p["z"].view(-1, self.local_num_heads, self.head_dim)
-        x = p["x"].view(-1, self.local_num_heads, self.head_dim)
-
-        # Normalize and expand B, C across heads
-        b = self.B_norm(p["b"].view(-1, self.n_groups, self.ssm_state_size)).expand(
-            -1, self.local_num_heads, -1
-        )
-        c = self.C_norm(p["c"].view(-1, self.n_groups, self.ssm_state_size)).expand(
-            -1, self.local_num_heads, -1
-        )
-        dt = F.softplus(p["dd_dt"] + self.dt_bias)
-        a = -F.softplus(p["dd_a"].float())
-
-        # Integration weightss
+        n = hidden_states.shape[0]
+        z = p["z"]   # already shaped [T, local_num_heads, head_dim] from _project
+        x = p["x"]
+        b = self.B_norm(p["b"].view(n, self.n_groups, self.ssm_state_size))
+        c = self.C_norm(p["c"].view(n, self.n_groups, self.ssm_state_size))
+        dt      = F.softplus(p["dd_dt"] + self.dt_bias)
+        a       = -F.softplus(p["dd_a"].float())
         simpson = torch.sigmoid(p["simpson"])
         midpoint = torch.sigmoid(p["midpoint"]) if p["midpoint"] is not None else None
-
-        angles = p["angles"].unsqueeze(1).expand(-1, self.local_num_heads, -1)
+        angles  = p["angles"].unsqueeze(1).expand(-1, self.local_num_heads, -1)
 
         # Choose backend kernel
         op = (
@@ -808,12 +801,14 @@ class SimambaMixer(MambaBase, PluggableLayer):
         out = out.view(-1, self.local_d_inner)
         return out, tuple(next_states)
 
-    def _finalize(self, y: torch.Tensor, z_local: torch.Tensor | None) -> torch.Tensor:
+    def _finalize(self, y: torch.Tensor, z: torch.Tensor | None) -> torch.Tensor:
         '''
         Apply optional output normalization (e.g. gated / RMSNorm variant)
         '''
         if self.norm is not None and z_local is not None:
-            y = self.norm(y, z_local)
+            # Flatten now that we get original z
+            z_flat = z.reshape(y.shape[0], self.local_d_inner)
+            y = self.norm(y, z_flat)
         return self.out_proj(y)[0]
 
     def forward(self, hidden_states: torch.Tensor, output: torch.Tensor) -> None:
@@ -832,54 +827,10 @@ class SimambaMixer(MambaBase, PluggableLayer):
         # Case 1: No metadata so treat as single prefill (standalone forward)
         if attn_metadata is None:
             p = self._project(hidden_states)
-            z_local = p["z"]
-
-            # Run full prefill with synthetic metadata (no cached states)
-            y_local = self._run_prefill(
-                hidden_states,
-                Mamba2AttentionMetadata(
-                    num_prefills=1,
-                    num_prefill_tokens=hidden_states.shape[0],
-                    num_decodes=0,
-                    num_decode_tokens=0,
-                    num_reqs=1,
-
-                    has_initial_states_p=torch.zeros(
-                        1, device=hidden_states.device, dtype=torch.bool
-                    ),
-                    # Single contiguous sequence
-                    query_start_loc_p=torch.tensor(
-                        [0, hidden_states.shape[0]],
-                        device=hidden_states.device,
-                        dtype=torch.int32,
-                    ),
-                    num_computed_tokens_p=None,
-                    state_indices_tensor_p=torch.full(
-                        (1,), NULL_BLOCK_ID, device=hidden_states.device, dtype=torch.int32
-                    ),
-                    state_indices_tensor_d=None,
-                    query_start_loc_d=None,
-                    num_accepted_tokens=None,
-                    # Scheduling/block metadata (not used here for now?)
-                    block_idx_last_scheduled_token=None,
-                    block_idx_first_scheduled_token_p=None,
-                    block_idx_last_computed_token=None,
-                    # Sequence length info
-                    seq_lens=torch.tensor(
-                        [hidden_states.shape[0]], device=hidden_states.device, dtype=torch.int32
-                    ),
-                    # Chunked prefill metadata
-                    cu_chunk_seqlen_p=torch.tensor(
-                        [0, hidden_states.shape[0]],
-                        device=hidden_states.device,
-                        dtype=torch.int32,
-                    ),
-                    last_chunk_indices_p=torch.tensor(
-                        [0], device=hidden_states.device, dtype=torch.int32
-                    ),
-                ),
+            y_local, z_shaped = self._run_prefill(hidden_states, dummy_metadata, p)
+            output[: hidden_states.shape[0]] = self._finalize(
+                y_local, z_shaped if self.norm is not None else None
             )
-            output[: hidden_states.shape[0]] = self._finalize(y_local, z_local)
             return
         
         # Case 2: Normal execution with scheduler metadata
