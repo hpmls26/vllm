@@ -7,6 +7,10 @@ from vllm.model_executor.layers.mamba.simamba_mixer import SimambaMixer
 
 
 def _make_fake_vllm_config():
+    '''
+    Creates a minimal fake vLLM configuration object used to avoid
+    initializing real distributed or compilation dependencies during tests.
+    '''
     return SimpleNamespace(
         compilation_config=SimpleNamespace(
             static_forward_context={},
@@ -23,6 +27,13 @@ def _build_mixer(
     cache_config=None,
     is_outproj_norm=False,
 ):
+    '''
+    Constructs a SimambaMixer instance in a fully mocked environment.
+
+    This function patches all required distributed state, configuration
+    accessors, and custom op registration hooks so that the mixer can be
+    instantiated in isolation without a real vLLM runtime or tensor-parallel setup.
+    '''
     fake_vllm_config = _make_fake_vllm_config()
 
     fake_tp_group = MagicMock()
@@ -105,6 +116,10 @@ def mixer_fixture():
 
 
 def test_finalize_accepts_shaped_z(mixer_fixture):
+    '''
+    Verifies that _finalize correctly processes structured multihead
+    z tensors and returns output with the expected hidden size.
+    '''
     mixer = mixer_fixture
     T = 4
     y = torch.zeros(T, mixer.local_d_inner)
@@ -115,6 +130,10 @@ def test_finalize_accepts_shaped_z(mixer_fixture):
 
 
 def test_project_returns_shaped_z(mixer_fixture):
+    '''
+    Ensures `_project` produces correctly shaped tensors for z, x, b, and c
+    given a hidden input.
+    '''
     mixer = mixer_fixture
     T = 4
     hidden = torch.randn(T, mixer.hidden_size)

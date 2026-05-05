@@ -16,11 +16,10 @@ from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadata
 
 
 def _make_vllm_config():
-    """
-    Create a minimal synthetic vLLM configuration object to avoid
-    needing a full HuggingFace model config and instead provides 
-    only the fields required by Simamba state utilities.
-    """
+    '''
+    Builds a minimal synthetic vLLM configuration object to avoid requiring 
+    a full HuggingFace or runtime config.
+    '''
     hf_config = SimpleNamespace(
         d_model=512,    
         n_layer=8,
@@ -55,6 +54,7 @@ def _make_vllm_config():
 def test_simamba_registry_aliases_resolve():
     '''
     Ensure model registry aliases resolve correctly.
+
     Both "SimambaForCausalLM" and "MambaLMHeadModel" should resolve 
     to the same underlying implementation class.
     '''
@@ -66,14 +66,12 @@ def test_simamba_registry_aliases_resolve():
 
 
 def test_simamba_state_contract():
-    """
-    Validate that Simamba exposes a consistent internal state contract. 
-    Specifically checks:
-        - Number of state tensors
-        - Shapes of each tensor
-        - dtypes of each tensor
-        - Presence of valid copy functions
-    """
+    '''
+    Validates Simamba internal state tensor contract. 
+    
+    Checks all expected state tensors are present, tensor shapes match 
+    configuration-derived expectations, and copy functions exist and are callable
+    '''
     vllm_config = _make_vllm_config()
 
     hf = vllm_config.model_config.hf_config
@@ -118,6 +116,12 @@ def test_simamba_state_contract():
 
 
 def test_simamba_prefix_cache_prefill_matches_full_prefill(mixer_factory):
+    '''
+    Ensures prefix-cached prefill produces identical results to full prefill.
+
+    Verifies correctness of incremental caching logic by comparing final output tokens
+    , kv/state cache contents, and consistency across chunked vs full sequence execution
+    '''
     model_config = SimpleNamespace(
         dtype=torch.float32,
         get_mamba_chunk_size=lambda: 2,
@@ -130,6 +134,12 @@ def test_simamba_prefix_cache_prefill_matches_full_prefill(mixer_factory):
     )
 
     def make_mixer():
+        '''
+        Constructs a SimambaMixer instance with an initialized KV cache.
+
+        The cache is preallocated using the mixer’s expected state shapes and dtypes, 
+        simulating a realistic runtime environment for prefill and cache update testing.
+        '''
         mixer = mixer_factory(model_config=model_config, cache_config=cache_config)
         mixer.kv_cache = tuple(
             torch.zeros((2,) + shape, dtype=dtype)
@@ -143,6 +153,12 @@ def test_simamba_prefix_cache_prefill_matches_full_prefill(mixer_factory):
         num_scheduled_tokens: int,
         block_idx_last_computed_token: int,
     ) -> Mamba2AttentionMetadata:
+        '''
+        Builds synthetic Mamba2AttentionMetadata for prefill execution.
+
+        Simulates different stages of prefix + suffix processing by controlling 
+        how many tokens are already computed vs scheduled.
+        '''
         total_seq_len = num_computed_tokens + num_scheduled_tokens
         return Mamba2AttentionMetadata(
             num_prefills=1,
@@ -235,11 +251,14 @@ def test_simamba_prefix_cache_prefill_matches_full_prefill(mixer_factory):
 
 
 def test_finalize_accepts_shaped_z(mixer_fixture):
-    """
-    _finalize must accept z in shaped form [T, H, D] and flatten it
-    before passing to RMSNormGated. A flat [T, local_d_inner] z must
-    also work (for the non-outproj-norm path).
-    """
+    '''
+    Verifies _finalize correctly handles both shaped and flattened z inputs.
+
+    Ensures:
+        - z shaped as [T, H, D] is accepted and properly processed
+        - Output tensor shape matches expected hidden size
+        - No failure across different projection modes
+    '''
     T = 4
     y = torch.zeros(T, mixer_fixture.local_d_inner)
     z_shaped = torch.zeros(T, mixer_fixture.local_num_heads, mixer_fixture.head_dim)
