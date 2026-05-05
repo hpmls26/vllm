@@ -76,8 +76,27 @@ def test_simamba_state_contract():
     """
     vllm_config = _make_vllm_config()
 
-    shapes = SimambaForCausalLM.get_mamba_state_shape_from_config(vllm_config)
-    dtypes = SimambaForCausalLM.get_mamba_state_dtype_from_config(vllm_config)
+    hf = vllm_config.model_config.hf_config
+    ssm = hf.ssm_cfg
+
+    hidden_size = hf.d_model
+    expand      = ssm["expand"]
+    head_dim    = ssm["headdim"]
+    d_state     = ssm["d_state"]
+    rope_frac   = ssm["rope_fraction"]
+    tp          = vllm_config.parallel_config.tensor_parallel_size
+
+    d_inner         = hidden_size * expand           # 1024
+    num_heads       = d_inner // head_dim            # 16
+    local_num_heads = num_heads // tp                # 8
+
+    split = int(d_state * rope_frac)
+    if split % 2 != 0:
+        split -= 1
+    num_rope_angles = split // 2                     # 32
+
+    shapes     = SimambaForCausalLM.get_mamba_state_shape_from_config(vllm_config)
+    dtypes     = SimambaForCausalLM.get_mamba_state_dtype_from_config(vllm_config)
     copy_funcs = SimambaForCausalLM.get_mamba_state_copy_func()
 
     # Check all expected state components exist
@@ -85,20 +104,14 @@ def test_simamba_state_contract():
     assert len(dtypes) == 6
     assert len(copy_funcs) == 6
     assert all(callable(copy_func) for copy_func in copy_funcs)
-    # Verify exact expected tensor shapes
-    assert shapes == (
-        (8, 32),
-        (8, 64, 128),
-        (8, 128),
-        (8, 128),
-        (8, 64),
-        (8, 64),
+    
+    expected_shapes = (
+        (local_num_heads, num_rope_angles),           # 0: angle  (8, 32)
+        (local_num_heads, head_dim, d_state),         # 1: ssm    (8, 64, 128)
+        (local_num_heads, d_state),                   # 2: k0     (8, 128)
+        (local_num_heads, d_state),                   # 3: k1     (8, 128)
+        (local_num_heads, head_dim),                  # 4: v0     (8, 64)
+        (local_num_heads, head_dim),                  # 5: v1     (8, 64)
     )
-    assert dtypes == (
-        torch.bfloat16,
-        torch.bfloat16,
-        torch.bfloat16,
-        torch.bfloat16,
-        torch.bfloat16,
-        torch.bfloat16,
-    )
+    assert shapes == expected_shapes, f"Got {shapes}, expected {expected_shapes}"
+    assert all(d == torch.bfloat16 for d in dtypes)

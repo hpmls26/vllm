@@ -466,8 +466,10 @@ class SimambaMixer(MambaBase, PluggableLayer):
         Input transformation step:
         hidden_states -> (z, x, b, c, dt, a, simpson, angles, optional midpoint)
         '''
-        z = self.z_proj(hidden_states)[0]
-        x = self.x_proj(hidden_states)[0]
+        n = hidden_states.shape[0]
+
+        z_flat = self.z_proj(hidden_states)[0]
+        x_flat = self.x_proj(hidden_states)[0]
         b = self.b_proj(hidden_states)[0]
         c = self.c_proj(hidden_states)[0]
         dd_dt = self.dt_proj(hidden_states)[0]
@@ -476,8 +478,8 @@ class SimambaMixer(MambaBase, PluggableLayer):
         midpoint = self.midpoint_proj(hidden_states)[0] if self.midpoint_proj else None
         angles = self.angle_proj(hidden_states)[0]
         return {
-            "z": z,
-            "x": x,
+            "z": z_flat.view(n, self.local_num_heads, self.head_dim), 
+            "x": x_flat.view(n, self.local_num_heads, self.head_dim),
             "b": b,
             "c": c,
             "dd_dt": dd_dt,
@@ -733,6 +735,29 @@ class SimambaMixer(MambaBase, PluggableLayer):
 
         return torch.cat(out_chunks, dim=0)
 
+    def _expand_bc_to_heads(
+        self,
+        b: torch.Tensor,   # [T, n_groups, ssm_state_size]
+        c: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        '''
+        Helper that correctly assigns groups to their heads when n groups > 1
+        '''
+        if self.n_groups == 1:
+            return (
+                b.expand(-1, self.local_num_heads, -1),
+                c.expand(-1, self.local_num_heads, -1),
+            )
+        # n_groups > 1: tp_size == 1 is guaranteed by init guard
+        heads_per_group = self.local_num_heads // self.n_groups
+        b = (b.unsqueeze(2)
+            .expand(-1, -1, heads_per_group, -1)
+            .reshape(b.shape[0], self.local_num_heads, self.ssm_state_size))
+        c = (c.unsqueeze(2)
+            .expand(-1, -1, heads_per_group, -1)
+            .reshape(c.shape[0], self.local_num_heads, self.ssm_state_size))
+        return b, c
+
     def _run_step_batch(
         self,
         hidden_states: torch.Tensor,
@@ -750,11 +775,15 @@ class SimambaMixer(MambaBase, PluggableLayer):
         x = p["x"]
         b = self.B_norm(p["b"].view(n, self.n_groups, self.ssm_state_size))
         c = self.C_norm(p["c"].view(n, self.n_groups, self.ssm_state_size))
-        dt      = F.softplus(p["dd_dt"] + self.dt_bias)
-        a       = -F.softplus(p["dd_a"].float())
+
+        # Expand groups into heads now
+        b, c = self._expand_bc_to_heads(b, c)
+
+        dt = F.softplus(p["dd_dt"] + self.dt_bias)
+        a = -F.softplus(p["dd_a"].float())
         simpson = torch.sigmoid(p["simpson"])
         midpoint = torch.sigmoid(p["midpoint"]) if p["midpoint"] is not None else None
-        angles  = p["angles"].unsqueeze(1).expand(-1, self.local_num_heads, -1)
+        angles = p["angles"].unsqueeze(1).expand(-1, self.local_num_heads, -1)
 
         # Choose backend kernel
         op = (
