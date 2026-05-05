@@ -685,7 +685,8 @@ class SimambaMixer(MambaBase, PluggableLayer):
         self,
         hidden_states: torch.Tensor,
         metadata: Mamba2AttentionMetadata,
-    ) -> torch.Tensor:
+        p: dict[str, torch.Tensor | None]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         '''
         Decode handles autoregressive generation (step-by-step or short chunks)
         '''
@@ -706,9 +707,9 @@ class SimambaMixer(MambaBase, PluggableLayer):
         # Fast path: all sequences are single-token -> batch step
         if all(q_len == 1 for q_len in q_lens):
             init_states = self._gather_states(state_indices, state_cols=start_cols)
-            out, next_states = self._run_step_batch(hidden_states, init_states)
+            y_flat, next_states = self._run_step_batch(hidden_states, init_states, p)
             self._scatter_states(state_indices[:, 0], next_states)
-            return out
+            return y_flat, p["z"]
 
         # General path: variable-length decode per request
         token_offset = 0
@@ -721,8 +722,11 @@ class SimambaMixer(MambaBase, PluggableLayer):
 
             # Step through tokens sequentially
             for step_idx in range(q_len):
-                out_step, states = self._run_step_batch(
-                    hidden_states[token_offset : token_offset + 1], states
+                tok = slice(token_offset, token_offset + 1)
+                p_step = {k: (v[tok] if v is not None else None) for k, v in p.items()}
+                # p_step passed not reprojected compared to old double projection method in decode path
+                y_step, next_states = self._run_step_batch(
+                    hidden_states[tok], states, p_step   
                 )
 
                 # Save updated state for this token
@@ -911,9 +915,11 @@ class SimambaMixer(MambaBase, PluggableLayer):
             # Project once to extract z for normalization later
             p_d = self._project(hs_d)
 
+            # Avoid reprojection
+            y_d, z_d = self._run_decode(hs_d, metadata, p_d)
             # Step wise decode
-            outputs.append(self._run_decode(hs_d, metadata))
-            z_chunks.append(p_d["z"])
+            outputs.append(y_d)
+            z_chunks.append(z_d)
 
         # Prefill phase (full sequence processing
         if prefill_tokens > 0:
