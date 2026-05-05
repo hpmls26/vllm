@@ -8,11 +8,21 @@ from vllm.model_executor.layers.mamba.simamba_mixer import SimambaMixer
 
 def _make_fake_vllm_config():
     return SimpleNamespace(
-        compilation_config=SimpleNamespace(static_forward_context={})
+        compilation_config=SimpleNamespace(
+            static_forward_context={},
+            custom_ops=["none"],
+            enabled_custom_ops=set(),
+            disabled_custom_ops=set(),
+        )
     )
 
-@pytest.fixture
-def mixer_fixture(): 
+
+def _build_mixer(
+    *,
+    model_config=None,
+    cache_config=None,
+    is_outproj_norm=False,
+):
     fake_vllm_config = _make_fake_vllm_config()
 
     fake_tp_group = MagicMock()
@@ -34,12 +44,18 @@ def mixer_fixture():
         patch(
             "vllm.model_executor.layers.linear.get_current_vllm_config",
             return_value=fake_vllm_config,
+            create=True,
         ),
         # Also patch it at the config module level in case anything calls
         # the canonical import path directly
         patch(
             "vllm.config.get_current_vllm_config",
             return_value=fake_vllm_config,
+        ),
+        patch(
+            "vllm.config.vllm.get_current_vllm_config",
+            return_value=fake_vllm_config,
+            create=True,
         ),
 
         # Patch TP rank/size in simamba_mixer's own namespace
@@ -70,12 +86,22 @@ def mixer_fixture():
             use_midpoint_control=False,
             simamba_backend="reference",
             simpson_boundary_mode="zero_pad",
-            is_outproj_norm=False,
-            model_config=None,
-            cache_config=None,
+            is_outproj_norm=is_outproj_norm,
+            model_config=model_config,
+            cache_config=cache_config,
             prefix="test",
         )
-        yield mixer
+        return mixer
+
+
+@pytest.fixture
+def mixer_factory():
+    return _build_mixer
+
+
+@pytest.fixture
+def mixer_fixture():
+    yield _build_mixer()
 
 
 def test_finalize_accepts_shaped_z(mixer_fixture):
