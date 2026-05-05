@@ -115,3 +115,18 @@ def test_simamba_state_contract():
     )
     assert shapes == expected_shapes, f"Got {shapes}, expected {expected_shapes}"
     assert all(d == torch.bfloat16 for d in dtypes)
+
+'''
+def test_finalize_accepts_shaped_z(mixer_fixture):
+    """
+    _finalize must accept z in shaped form [T, H, D] and flatten it
+    before passing to RMSNormGated. A flat [T, local_d_inner] z must
+    also work (for the non-outproj-norm path).
+    """
+    T = 4
+    y = torch.zeros(T, mixer_fixture.local_d_inner)
+    z_shaped = torch.zeros(T, mixer_fixture.local_num_heads, mixer_fixture.head_dim)
+    # Should not raise regardless of is_outproj_norm
+    out = mixer_fixture._finalize(y, z_shaped)
+    assert out.shape == (T, mixer_fixture.hidden_size)
+'''
