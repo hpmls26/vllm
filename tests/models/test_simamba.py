@@ -244,3 +244,46 @@ def test_expand_bc_to_heads_n_groups_1(mixer_factory):
     for h in range(mixer.local_num_heads):
         torch.testing.assert_close(b_exp[:, h, :], b[:, 0, :])
         torch.testing.assert_close(c_exp[:, h, :], c[:, 0, :])
+
+
+def test_step_batch_state_advances(mixer_factory):
+    """
+    Running two consecutive _run_step_batch calls must produce different
+    outputs and different states — verifying the state is actually threaded
+    through between steps and not reset.
+    """
+    model_config = SimpleNamespace(
+        dtype=torch.float32,
+        get_mamba_chunk_size=lambda: 2,
+    )
+    cache_config = SimpleNamespace(
+        mamba_cache_dtype="auto",
+        mamba_ssm_cache_dtype="auto",
+        mamba_cache_mode="none",
+        mamba_block_size=1,
+    )
+    mixer = mixer_factory(model_config=model_config, cache_config=cache_config)
+
+    torch.manual_seed(0)
+    h1 = 0.01 * torch.randn(1, mixer.hidden_size)
+    h2 = 0.01 * torch.randn(1, mixer.hidden_size)
+
+    init_states = tuple(
+        torch.zeros((1,) + shape, dtype=dtype)
+        for shape, dtype in zip(mixer.get_state_shape(), mixer.get_state_dtype())
+    )
+
+    p1 = mixer._project(h1)
+    y1, states_after_1 = mixer._run_step_batch(h1, init_states, p1)
+
+    p2 = mixer._project(h2)
+    # Pass state from step 1 into step 2
+    y2_with_state, _ = mixer._run_step_batch(h2, states_after_1, p2)
+    # Pass zero state into step 2 (as if step 1 never happened)
+    y2_without_state, _ = mixer._run_step_batch(h2, init_states, p2)
+
+    # Outputs must differ because the state differs
+    assert not torch.allclose(y2_with_state, y2_without_state, atol=1e-6), (
+        "Step 2 output is identical with and without step 1 state — "
+        "state is not being threaded through correctly"
+    )
