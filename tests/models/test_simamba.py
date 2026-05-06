@@ -287,3 +287,47 @@ def test_step_batch_state_advances(mixer_factory):
         "Step 2 output is identical with and without step 1 state — "
         "state is not being threaded through correctly"
     )
+
+def test_decode_single_token_matches_prefill_single_token(mixer_factory):
+    """
+    Verifies a single-token decode step produces the same output as a single token
+    prefill from the same initial state.
+    """
+    model_config = SimpleNamespace(
+        dtype=torch.float32,
+        get_mamba_chunk_size=lambda: 2,
+    )
+    cache_config = SimpleNamespace(
+        mamba_cache_dtype="auto",
+        mamba_ssm_cache_dtype="auto",
+        mamba_cache_mode="all",
+        mamba_block_size=1,
+    )
+
+    mixer = mixer_factory(model_config=model_config, cache_config=cache_config)
+    mixer.kv_cache = tuple(
+        torch.zeros((2,) + shape, dtype=dtype)
+        for shape, dtype in zip(mixer.get_state_shape(), mixer.get_state_dtype())
+    )
+
+    torch.manual_seed(42)
+    hidden = 0.01 * torch.randn(1, 512)
+    p = mixer._project(hidden)
+
+    # Run as a single prefill step
+    init_states = tuple(
+        torch.zeros((1,) + shape, dtype=dtype)
+        for shape, dtype in zip(mixer.get_state_shape(), mixer.get_state_dtype())
+    )
+    y_prefill, next_states_prefill = mixer._run_step_batch(hidden, init_states, p)
+
+    # Run as explicit step_batch from same zero state
+    init_states2 = tuple(
+        torch.zeros((1,) + shape, dtype=dtype)
+        for shape, dtype in zip(mixer.get_state_shape(), mixer.get_state_dtype())
+    )
+    y_step, next_states_step = mixer._run_step_batch(hidden, init_states2, p)
+
+    torch.testing.assert_close(y_prefill, y_step, rtol=1e-5, atol=1e-5)
+    for s1, s2 in zip(next_states_prefill, next_states_step):
+        torch.testing.assert_close(s1, s2, rtol=1e-5, atol=1e-5)

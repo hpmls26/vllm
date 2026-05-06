@@ -944,6 +944,8 @@ class SimambaMixer(MambaBase, PluggableLayer):
             else simamba_triton_siso_step
         )
 
+        # Protect input states from in place mutation
+        safe_input_states = tuple(s.clone() for s in states)
         # Execute one SSM step
         if self.simamba_backend == SIMAMBA_BACKEND_REFERENCE:
             out, next_states = op(
@@ -963,6 +965,8 @@ class SimambaMixer(MambaBase, PluggableLayer):
                 boundary_mode=self.simpson_boundary_mode,
             )
         else:
+            # Allocate fresh output states so we don't reuse input
+            #next_states = tuple(s.clone() for s in safe_input_states)
             out, next_states = op(
                 Q=c,
                 K=b,
