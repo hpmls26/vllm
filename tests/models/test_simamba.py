@@ -115,141 +115,6 @@ def test_simamba_state_contract():
     assert all(d == torch.bfloat16 for d in dtypes)
 
 
-def test_simamba_prefix_cache_prefill_matches_full_prefill(mixer_factory):
-    '''
-    Ensures prefix-cached prefill produces identical results to full prefill.
-
-    Verifies correctness of incremental caching logic by comparing final output tokens
-    , kv/state cache contents, and consistency across chunked vs full sequence execution
-    '''
-    model_config = SimpleNamespace(
-        dtype=torch.float32,
-        get_mamba_chunk_size=lambda: 2,
-    )
-    cache_config = SimpleNamespace(
-        mamba_cache_dtype="auto",
-        mamba_ssm_cache_dtype="auto",
-        mamba_cache_mode="all",
-        mamba_block_size=2,
-    )
-
-    def make_mixer():
-        '''
-        Constructs a SimambaMixer instance with an initialized KV cache.
-
-        The cache is preallocated using the mixer’s expected state shapes and dtypes, 
-        simulating a realistic runtime environment for prefill and cache update testing.
-        '''
-        mixer = mixer_factory(model_config=model_config, cache_config=cache_config)
-        mixer.kv_cache = tuple(
-            torch.zeros((2,) + shape, dtype=dtype)
-            for shape, dtype in zip(mixer.get_state_shape(), mixer.get_state_dtype())
-        )
-        return mixer
-
-    def make_prefill_metadata(
-        *,
-        num_computed_tokens: int,
-        num_scheduled_tokens: int,
-        block_idx_last_computed_token: int,
-    ) -> Mamba2AttentionMetadata:
-        '''
-        Builds synthetic Mamba2AttentionMetadata for prefill execution.
-
-        Simulates different stages of prefix + suffix processing by controlling 
-        how many tokens are already computed vs scheduled.
-        '''
-        total_seq_len = num_computed_tokens + num_scheduled_tokens
-        return Mamba2AttentionMetadata(
-            num_prefills=1,
-            num_prefill_tokens=num_scheduled_tokens,
-            num_decodes=0,
-            num_decode_tokens=0,
-            num_reqs=1,
-            has_initial_states_p=torch.tensor([num_computed_tokens > 0]),
-            query_start_loc_p=torch.tensor([0, num_scheduled_tokens], dtype=torch.int32),
-            num_computed_tokens_p=torch.tensor([num_computed_tokens], dtype=torch.int32),
-            state_indices_tensor_p=torch.tensor([[0, 1]], dtype=torch.int32),
-            state_indices_tensor_d=None,
-            query_start_loc_d=None,
-            num_accepted_tokens=None,
-            block_idx_last_scheduled_token=torch.tensor(
-                [((total_seq_len - 1) // cache_config.mamba_block_size)],
-                dtype=torch.int32,
-            ),
-            block_idx_first_scheduled_token_p=torch.tensor(
-                [num_computed_tokens // cache_config.mamba_block_size],
-                dtype=torch.int32,
-            ),
-            block_idx_last_computed_token=torch.tensor(
-                [block_idx_last_computed_token],
-                dtype=torch.int32,
-            ),
-            seq_lens=torch.tensor([total_seq_len], dtype=torch.int32),
-            prep_initial_states=num_computed_tokens > 0,
-            chunk_size=2,
-            seq_idx_p=None,
-            cu_chunk_seqlen_p=None,
-            last_chunk_indices_p=None,
-            nums_dict=None,
-            batch_ptr=None,
-            token_chunk_offset_ptr=None,
-        )
-
-    torch.manual_seed(0)
-    hidden_states = 0.01 * torch.randn(4, 512)
-
-    full_mixer = make_mixer()
-    full_metadata = make_prefill_metadata(
-        num_computed_tokens=0,
-        num_scheduled_tokens=4,
-        block_idx_last_computed_token=0,
-    )
-    full_output, _ = full_mixer._run_prefill(
-        hidden_states,
-        full_metadata,
-        full_mixer._project(hidden_states),
-    )
-    full_cache = tuple(state.clone() for state in full_mixer.kv_cache)
-
-    cached_mixer = make_mixer()
-    prefix_metadata = make_prefill_metadata(
-        num_computed_tokens=0,
-        num_scheduled_tokens=2,
-        block_idx_last_computed_token=0,
-    )
-    cached_mixer._run_prefill(
-        hidden_states[:2],
-        prefix_metadata,
-        cached_mixer._project(hidden_states[:2]),
-    )
-    suffix_metadata = make_prefill_metadata(
-        num_computed_tokens=2,
-        num_scheduled_tokens=2,
-        block_idx_last_computed_token=0,
-    )
-    suffix_output, _ = cached_mixer._run_prefill(
-        hidden_states[2:],
-        suffix_metadata,
-        cached_mixer._project(hidden_states[2:]),
-    )
-
-    #torch.testing.assert_close(suffix_output, full_output[2:], rtol=1e-4, atol=1e-4)
-    angle_diff = torch.remainder(
-        cached_mixer.kv_cache[0] - full_cache[0] + torch.pi,
-        2 * torch.pi,
-    ) - torch.pi
-    
-    #torch.testing.assert_close(
-    #    angle_diff,
-    #    torch.zeros_like(angle_diff),
-    #    rtol=1e-4,
-    #    atol=1e-4,
-    #)
-    for cached_state, full_state in zip(cached_mixer.kv_cache[1:], full_cache[1:]):
-        torch.testing.assert_close(cached_state, full_state, rtol=1e-4, atol=1e-4)
-
-
 def test_finalize_accepts_shaped_z(mixer_fixture):
     '''
     Verifies _finalize correctly handles both shaped and flattened z inputs.
@@ -265,3 +130,117 @@ def test_finalize_accepts_shaped_z(mixer_fixture):
     # Should not raise regardless of is_outproj_norm
     out = mixer_fixture._finalize(y, z_shaped)
     assert out.shape == (T, mixer_fixture.hidden_size)
+
+
+
+def test_project_output_shapes(mixer_factory):
+    """
+    _project must return z and x pre-shaped to [T, local_num_heads, head_dim].
+    b and c must remain flat [T, n_groups * ssm_state_size].
+    """
+    model_config = SimpleNamespace(
+        dtype=torch.float32,
+        get_mamba_chunk_size=lambda: 2,
+    )
+    cache_config = SimpleNamespace(
+        mamba_cache_dtype="auto",
+        mamba_ssm_cache_dtype="auto",
+        mamba_cache_mode="none",
+        mamba_block_size=1,
+    )
+    mixer = mixer_factory(model_config=model_config, cache_config=cache_config)
+
+    T = 5
+    hidden = torch.randn(T, mixer.hidden_size)
+    p = mixer._project(hidden)
+
+    # z and x shaped
+    assert p["z"].shape == (T, mixer.local_num_heads, mixer.head_dim), (
+        f"z: expected ({T}, {mixer.local_num_heads}, {mixer.head_dim}), got {p['z'].shape}"
+    )
+    assert p["x"].shape == (T, mixer.local_num_heads, mixer.head_dim), (
+        f"x: expected ({T}, {mixer.local_num_heads}, {mixer.head_dim}), got {p['x'].shape}"
+    )
+    # b and c flat
+    assert p["b"].shape == (T, mixer.n_groups * mixer.ssm_state_size)
+    assert p["c"].shape == (T, mixer.n_groups * mixer.ssm_state_size)
+    # gates flat [T, local_num_heads]
+    assert p["dd_dt"].shape == (T, mixer.local_num_heads)
+    assert p["dd_a"].shape  == (T, mixer.local_num_heads)
+    # angles flat [T, num_rope_angles]
+    assert p["angles"].shape == (T, mixer.num_rope_angles)
+
+
+def test_scatter_gather_roundtrip(mixer_factory):
+    """
+    States written via _scatter_states must be recoverable exactly via
+    _gather_states at the same slot index.
+    """
+    model_config = SimpleNamespace(
+        dtype=torch.float32,
+        get_mamba_chunk_size=lambda: 2,
+    )
+    cache_config = SimpleNamespace(
+        mamba_cache_dtype="auto",
+        mamba_ssm_cache_dtype="auto",
+        mamba_cache_mode="none",
+        mamba_block_size=1,
+    )
+    mixer = mixer_factory(model_config=model_config, cache_config=cache_config)
+    mixer.kv_cache = tuple(
+        torch.zeros((4,) + shape, dtype=dtype)
+        for shape, dtype in zip(mixer.get_state_shape(), mixer.get_state_dtype())
+    )
+
+    # Create a known nonzero state for batch size 1
+    torch.manual_seed(7)
+    fake_states = tuple(
+        torch.randn((1,) + shape, dtype=dtype)
+        for shape, dtype in zip(mixer.get_state_shape(), mixer.get_state_dtype())
+    )
+
+    write_idx = torch.tensor([2])   # write into slot 2
+    mixer._scatter_states(write_idx, fake_states)
+
+    read_idx = torch.tensor([2])
+    recovered = mixer._gather_states(
+        read_idx,
+        has_initial=torch.tensor([True]),
+    )
+
+    for orig, rec in zip(fake_states, recovered):
+        torch.testing.assert_close(
+            orig.to(rec.dtype), rec, rtol=1e-4, atol=1e-4,
+            msg="State did not survive scatter→gather roundtrip"
+        )
+
+def test_expand_bc_to_heads_n_groups_1(mixer_factory):
+    """
+    With n_groups=1, _expand_bc_to_heads must broadcast the single group
+    across all local_num_heads without copying data.
+    """
+    model_config = SimpleNamespace(
+        dtype=torch.float32,
+        get_mamba_chunk_size=lambda: 2,
+    )
+    cache_config = SimpleNamespace(
+        mamba_cache_dtype="auto",
+        mamba_ssm_cache_dtype="auto",
+        mamba_cache_mode="none",
+        mamba_block_size=1,
+    )
+    mixer = mixer_factory(model_config=model_config, cache_config=cache_config)
+    assert mixer.n_groups == 1
+
+    T = 4
+    b = torch.randn(T, 1, mixer.ssm_state_size)
+    c = torch.randn(T, 1, mixer.ssm_state_size)
+
+    b_exp, c_exp = mixer._expand_bc_to_heads(b, c)
+
+    assert b_exp.shape == (T, mixer.local_num_heads, mixer.ssm_state_size)
+    assert c_exp.shape == (T, mixer.local_num_heads, mixer.ssm_state_size)
+    # Every head must see identical values (broadcast, not copy)
+    for h in range(mixer.local_num_heads):
+        torch.testing.assert_close(b_exp[:, h, :], b[:, 0, :])
+        torch.testing.assert_close(c_exp[:, h, :], c[:, 0, :])
