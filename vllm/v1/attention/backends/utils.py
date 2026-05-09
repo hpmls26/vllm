@@ -545,8 +545,9 @@ def split_decodes_and_prefills(
         is_prefill = query_lens > decode_threshold
 
     if not treat_short_extends_as_decodes:
-        assert common_attn_metadata.is_prefilling is not None
-        is_prefill |= common_attn_metadata.is_prefilling
+        is_prefilling = getattr(common_attn_metadata, "is_prefilling", None)
+        if is_prefilling is not None:
+            is_prefill |= is_prefilling
 
     if not torch.any(is_prefill):
         return num_reqs, 0, num_tokens, 0
