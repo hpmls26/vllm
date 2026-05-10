@@ -145,12 +145,12 @@ class SimambaModel(nn.Module):
         # Build decoder layers with pipeline parallel partitioning
         self.start_layer, self.end_layer, self.layers = make_layers(
             _get_num_layers(config),
-            lambda layer_prefix: SimambaDecoderLayer(
+            lambda prefix: SimambaDecoderLayer(
                 config,
                 model_config=vllm_config.model_config,
                 cache_config=vllm_config.cache_config,
                 quant_config=vllm_config.quant_config,
-                prefix=layer_prefix,
+                prefix=prefix,
             ),
             prefix=f"{prefix}.layers",
         )
@@ -350,6 +350,10 @@ class SimambaForCausalLM(nn.Module, HasInnerState, IsAttentionFree, SupportsPP):
             # Handle fused input projection weights
             if name.endswith(".mixer.in_proj.weight"):
                 prefix = name[: -len("in_proj.weight")]
+                direct_name = f"{prefix}in_proj.weight"
+                if direct_name in params_dict:
+                    params_dict[direct_name].data.copy_(loaded_weight)
+                    loaded.add(direct_name)
 
                 # Target split projections
                 targets = [

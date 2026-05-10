@@ -179,6 +179,22 @@ class SimambaMixer(MambaBase, PluggableLayer):
             raise ValueError("Simamba requires at least one rotary angle pair.")
 
         num_head_controls = 4 if use_midpoint_control else 3
+        self.in_proj_dim = (
+            2 * self.d_inner
+            + 2 * n_groups * ssm_state_size
+            + num_head_controls * self.num_heads
+            + self.num_rope_angles
+        )
+        self.use_fused_in_proj = self.tp_size == 1
+
+        # For the batch-size-1 profiling path, keep the checkpoint's fused
+        # input projection as one GEMV instead of launching one GEMV per slice.
+        self.in_proj = ReplicatedLinear(
+            hidden_size,
+            self.in_proj_dim,
+            bias=False,
+            prefix=f"{prefix}.in_proj",
+        )
 
 
         # Input projection layers
@@ -288,6 +304,7 @@ class SimambaMixer(MambaBase, PluggableLayer):
 
         # Allocate per-layer state cache (6 tensors total)
         self.kv_cache = tuple(torch.tensor([]) for _ in range(6))
+        self._single_decode_states: tuple[torch.Tensor, ...] | None = None
 
     def _init_dt_bias(self) -> None:
         '''
@@ -425,11 +442,10 @@ class SimambaMixer(MambaBase, PluggableLayer):
 
         def local_head_state_loader(param: Parameter, loaded_weight: torch.Tensor) -> None:
             # Same logic but used for state-related bias tensors
-            param.data.copy_(
-                loaded_weight[
-                    local_head_start : local_head_start + param.shape[0]
-                ]
-            )
+            shard = loaded_weight[local_head_start : local_head_start + param.shape[0]]
+            if shard.ndim == param.ndim + 1 and shard.shape[1] == 1:
+                shard = shard.squeeze(1)
+            param.data.copy_(shard)
 
         set_loader(self.dt_bias, local_head_loader)
         set_loader(self.D, local_head_loader)
@@ -461,15 +477,40 @@ class SimambaMixer(MambaBase, PluggableLayer):
         '''
         n = hidden_states.shape[0]
 
-        z_flat = self.z_proj(hidden_states)[0]
-        x_flat = self.x_proj(hidden_states)[0]
-        b = self.b_proj(hidden_states)[0]
-        c = self.c_proj(hidden_states)[0]
-        dd_dt = self.dt_proj(hidden_states)[0]
-        dd_a = self.a_proj(hidden_states)[0]
-        simpson = self.simpson_proj(hidden_states)[0]
-        midpoint = self.midpoint_proj(hidden_states)[0] if self.midpoint_proj else None
-        angles = self.angle_proj(hidden_states)[0]
+        if self.use_fused_in_proj:
+            fused = self.in_proj(hidden_states)[0]
+            offset = 0
+
+            z_flat = fused[:, offset : offset + self.d_inner]
+            offset += self.d_inner
+            x_flat = fused[:, offset : offset + self.d_inner]
+            offset += self.d_inner
+            b = fused[:, offset : offset + self.n_groups * self.ssm_state_size]
+            offset += self.n_groups * self.ssm_state_size
+            c = fused[:, offset : offset + self.n_groups * self.ssm_state_size]
+            offset += self.n_groups * self.ssm_state_size
+            dd_dt = fused[:, offset : offset + self.num_heads]
+            offset += self.num_heads
+            dd_a = fused[:, offset : offset + self.num_heads]
+            offset += self.num_heads
+            simpson = fused[:, offset : offset + self.num_heads]
+            offset += self.num_heads
+            if self.use_midpoint_control:
+                midpoint = fused[:, offset : offset + self.num_heads]
+                offset += self.num_heads
+            else:
+                midpoint = None
+            angles = fused[:, offset : offset + self.num_rope_angles]
+        else:
+            z_flat = self.z_proj(hidden_states)[0]
+            x_flat = self.x_proj(hidden_states)[0]
+            b = self.b_proj(hidden_states)[0]
+            c = self.c_proj(hidden_states)[0]
+            dd_dt = self.dt_proj(hidden_states)[0]
+            dd_a = self.a_proj(hidden_states)[0]
+            simpson = self.simpson_proj(hidden_states)[0]
+            midpoint = self.midpoint_proj(hidden_states)[0] if self.midpoint_proj else None
+            angles = self.angle_proj(hidden_states)[0]
         return {
             "z": z_flat.view(n, self.local_num_heads, self.head_dim), 
             "x": x_flat.view(n, self.local_num_heads, self.head_dim),
@@ -521,6 +562,32 @@ class SimambaMixer(MambaBase, PluggableLayer):
         adt = a * dt
         return z, x, b, c, adt, midpoint, dt, p["angles"], simpson
 
+    def _norm_bc(
+        self,
+        p: dict[str, torch.Tensor | None],
+        n: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        b = self.B_norm(p["b"].view(n, self.n_groups, self.ssm_state_size))
+        c = self.C_norm(p["c"].view(n, self.n_groups, self.ssm_state_size))
+        return b, c
+
+    def _compute_gates(
+        self,
+        p: dict[str, torch.Tensor | None],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        dt = F.softplus(p["dd_dt"] + self.dt_bias)
+        a = -F.softplus(p["dd_a"].float())
+        adt = a * dt
+        simpson = torch.sigmoid(p["simpson"])
+        midpoint = torch.sigmoid(p["midpoint"]) if p["midpoint"] is not None else None
+        return adt, dt, simpson, midpoint
+
+    def _runtime_kv_cache(self):
+        if len(self.kv_cache) > 0 and isinstance(self.kv_cache[0], (list, tuple)):
+            forward_context: ForwardContext = get_forward_context()
+            return self.kv_cache[forward_context.virtual_engine]
+        return self.kv_cache
+
     def _scatter_states(
         self,
         state_indices: torch.Tensor,
@@ -531,12 +598,18 @@ class SimambaMixer(MambaBase, PluggableLayer):
 
         Only valid (non-NULL) entries are updated.
         '''
+        if state_indices.numel() == 1 and all(src.shape[0] == 1 for src in states):
+            index = state_indices.reshape(1).long()
+            for cache_state, src in zip(self._runtime_kv_cache(), states):
+                cache_state.index_copy_(0, index, src.to(cache_state.dtype))
+            return
+
         valid = state_indices != NULL_BLOCK_ID
         if not torch.any(valid):
             return
 
         indices = state_indices[valid].long()
-        for cache_state, src in zip(self.kv_cache, states):
+        for cache_state, src in zip(self._runtime_kv_cache(), states):
             cache_state[indices] = src[valid].to(cache_state.dtype)
 
     def _gather_states(
@@ -562,6 +635,13 @@ class SimambaMixer(MambaBase, PluggableLayer):
         angle_shape, ssm_shape, k_shape, _, v_shape, _ = self.get_state_shape()
         dtypes = self.get_state_dtype()
 
+        if batch == 1 and has_initial is None:
+            index = indices.reshape(1).long()
+            return tuple(
+                cache_state.index_select(0, index).to(dtype)
+                for cache_state, dtype in zip(self._runtime_kv_cache(), dtypes)
+            )
+
         # Initialize all states as zeros (default when cache is empty or invalid)
         zeros = (
             torch.zeros((batch,) + angle_shape, device=state_indices.device, dtype=dtypes[0]),
@@ -586,7 +666,7 @@ class SimambaMixer(MambaBase, PluggableLayer):
         # Gather valid cache indices
         src_indices = indices[valid].long()
         # Copy cached states into output tensors at valid positions
-        for dst_state, cache_state in zip(out, self.kv_cache):
+        for dst_state, cache_state in zip(out, self._runtime_kv_cache()):
             dst_state[valid] = cache_state[src_indices].to(dst_state.dtype)
         return tuple(out)
 
@@ -644,13 +724,12 @@ class SimambaMixer(MambaBase, PluggableLayer):
 
             if is_cache_all:
                 # -----------------------------------------------------------
-                # Cache-all mode: must write state at every block boundary.
-                # Use step-by-step execution so we can scatter at each boundary.
-                # This is intentionally slower; it is only used when the caller
-                # specifically requests full intermediate state caching.
+                # Cache-all mode must write state at block boundaries for
+                # prefix caching, so it uses step execution instead of the
+                # chunked sequence kernel.
                 # -----------------------------------------------------------
                 num_computed = int(metadata.num_computed_tokens_p[req_idx].item())
-                init_col     = block_idx_last_computed[req_idx : req_idx + 1]
+                init_col = block_idx_last_computed[req_idx : req_idx + 1]
 
                 states = self._gather_states(
                     state_indices[req_idx : req_idx + 1],
@@ -679,6 +758,8 @@ class SimambaMixer(MambaBase, PluggableLayer):
                             state_indices[req_idx : req_idx + 1, block_idx], states
                         )
 
+                if len(q_lens) == 1 and q_len > 0:
+                    self._single_decode_states = tuple(states)
                 out_chunks.append(torch.cat(req_out, dim=0))
 
             else:
@@ -736,12 +817,6 @@ class SimambaMixer(MambaBase, PluggableLayer):
                         boundary_mode=self.simpson_boundary_mode,
                     )
                 else:
-                    # Build per-sequence cu_seqlens for this single sequence.
-                    cu = torch.tensor(
-                        [0, n],
-                        device=hidden_states.device,
-                        dtype=torch.int32,
-                    )
                     out, *final_states = simamba_triton_siso_combined(
                         Q=q_k,
                         K=k_k,
@@ -758,7 +833,6 @@ class SimambaMixer(MambaBase, PluggableLayer):
                         Initial_States=init_states,
                         chunk_size=self.chunk_size,
                         return_final_states=True,
-                        cu_seqlens=cu,
                     )
 
                 # Scatter final state into the single write slot.
@@ -766,6 +840,8 @@ class SimambaMixer(MambaBase, PluggableLayer):
                 if write_si.ndim == 2:
                     write_si = write_si[:, 0]
                 self._scatter_states(write_si, tuple(final_states))
+                if len(q_lens) == 1 and q_len > 0:
+                    self._single_decode_states = tuple(final_states)
                 out_chunks.append(out.view(n, self.local_d_inner))
 
             z_chunks.append(z_seq)
@@ -787,6 +863,7 @@ class SimambaMixer(MambaBase, PluggableLayer):
 
         # Split decode tokens into per-request lengths
         q_lens = _split_lengths(metadata.query_start_loc_d, metadata.num_decodes)
+        all_single_token = all(q_len == 1 for q_len in q_lens)
         out_chunks: list[torch.Tensor] = []
         z_chunks: list[torch.Tensor] = []
         is_cache_all = self.cache_config.mamba_cache_mode == "all"
@@ -797,13 +874,15 @@ class SimambaMixer(MambaBase, PluggableLayer):
             block_idx_last_computed_token = metadata.block_idx_last_computed_token[
                 : metadata.num_decodes
             ]
-            num_computed_tokens = metadata.seq_lens[: metadata.num_decodes].to(
-                torch.int64
-            ) - torch.tensor(
-                q_lens,
-                device=hidden_states.device,
-                dtype=torch.int64,
-            )
+            num_computed_tokens = metadata.seq_lens[: metadata.num_decodes].to(torch.int64)
+            if all_single_token:
+                num_computed_tokens = num_computed_tokens - 1
+            else:
+                num_computed_tokens = num_computed_tokens - torch.tensor(
+                    q_lens,
+                    device=hidden_states.device,
+                    dtype=torch.int64,
+                )
         else:
             block_idx_last_computed_token = None
             num_computed_tokens = None
@@ -816,7 +895,20 @@ class SimambaMixer(MambaBase, PluggableLayer):
         )
 
         # Fast path: all sequences are single-token -> batch step
-        if all(q_len == 1 for q_len in q_lens):
+        if all_single_token:
+            if (
+                not is_cache_all
+                and hidden_states.shape[0] == 1
+                and state_indices.shape[0] == 1
+                and state_indices.shape[1] == 1
+                and self._single_decode_states is not None
+            ):
+                y_flat, next_states = self._run_step_batch(
+                    hidden_states, self._single_decode_states, p
+                )
+                self._single_decode_states = tuple(next_states)
+                return y_flat, p["z"]
+
             init_cols = block_idx_last_computed_token if is_cache_all else start_cols
             init_states = self._gather_states(state_indices, state_cols=init_cols)
             y_flat, next_states = self._run_step_batch(hidden_states, init_states, p)
@@ -833,9 +925,12 @@ class SimambaMixer(MambaBase, PluggableLayer):
                 self._scatter_states(output_indices, next_states)
             else:
                 self._scatter_states(state_indices[:, 0], next_states)
+                if hidden_states.shape[0] == 1 and state_indices.shape[0] == 1:
+                    self._single_decode_states = tuple(next_states)
             return y_flat, p["z"]
 
         # General path: variable-length decode per request
+        self._single_decode_states = None
         token_offset = 0
         for req_idx, q_len in enumerate(q_lens):
             tok = slice(token_offset, token_offset + q_len)
@@ -944,8 +1039,6 @@ class SimambaMixer(MambaBase, PluggableLayer):
             else simamba_triton_siso_step
         )
 
-        # Protect input states from in place mutation
-        safe_input_states = tuple(s.clone() for s in states)
         # Execute one SSM step
         if self.simamba_backend == SIMAMBA_BACKEND_REFERENCE:
             out, next_states = op(
@@ -966,7 +1059,6 @@ class SimambaMixer(MambaBase, PluggableLayer):
             )
         else:
             # Allocate fresh output states so we don't reuse input
-            #next_states = tuple(s.clone() for s in safe_input_states)
             out, next_states = op(
                 Q=c,
                 K=b,
